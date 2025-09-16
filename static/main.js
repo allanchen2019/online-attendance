@@ -63,9 +63,10 @@ $(document).ready(function() {
             contentType: 'application/json',
             data: JSON.stringify(payload),
             success: function(response) {
-                // 【修改】提交成功后，直接跳转到报告页面
-                alert('提交成功！现在将跳转到报告页面。');
-                window.location.href = '/report';
+                // 【修改】提交成功后，只显示提示信息
+                alert('考勤记录提交成功！');
+                // 刷新页面或重置表单，以便进行下一次点名
+                location.reload();
             },
             error: function() {
                 alert('提交失败，请稍后重试。');
