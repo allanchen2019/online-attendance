@@ -12,9 +12,29 @@
         <h1 class="mb-4">今日缺勤汇总报告</h1>
         
         <!-- 使用<pre>标签可以保留报告的换行和空格格式 -->
-        <pre class="bg-light p-3 border rounded">{{ report_data }}</pre>
+        <pre id="report-content" class="bg-light p-3 border rounded">{{ report_data }}</pre>
 
         <a href="/" class="btn btn-primary mt-3">返回考勤页面</a>
+        <button type="button" class="btn btn-secondary mt-3" id="copy-btn">复制报告内容</button>
     </div>
+
+    <script>
+        document.getElementById('copy-btn').addEventListener('click', function() {
+            const reportText = document.getElementById('report-content').textContent;
+            navigator.clipboard.writeText(reportText).then(() => {
+                // 成功复制后的反馈
+                const originalText = this.textContent;
+                this.textContent = '已复制!';
+                this.classList.add('btn-success');
+                setTimeout(() => {
+                    this.textContent = originalText;
+                    this.classList.remove('btn-success');
+                }, 2000); // 2秒后恢复原状
+            }).catch(err => {
+                console.error('复制失败: ', err);
+                alert('复制失败，您的浏览器可能不支持此功能。');
+            });
+        });
+    </script>
 </body>
 </html>

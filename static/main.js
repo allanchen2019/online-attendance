@@ -15,11 +15,15 @@ $(document).ready(function() {
                 tableBody.append('<tr><td colspan="3" class="text-center">该班级下没有学生</td></tr>');
             } else {
                 students.forEach((student, index) => {
+                    const isAbsent = student.is_absent_today === 1;
+                    const rowClass = isAbsent ? 'absent-row' : '';
+                    const statusText = isAbsent ? '❌ 缺勤' : '✔️ 出勤';
+
                     const row = `
-                        <tr data-student-id="${student.id}" style="cursor: pointer;">
+                        <tr data-student-id="${student.id}" style="cursor: pointer;" class="${rowClass}">
                             <th scope="row">${index + 1}</th>
                             <td>${student.name}</td>
-                            <td>✔️ 出勤</td>
+                            <td>${statusText}</td>
                         </tr>
                     `;
                     tableBody.append(row);

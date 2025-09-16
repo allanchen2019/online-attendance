@@ -18,55 +18,99 @@ def get_db_connection():
 def index():
     """渲染主页面"""
     conn = get_db_connection()
-    # 【修改】只选择“教学班级”用于点名
-    classes = conn.execute("SELECT * FROM classes WHERE type = '教学' ORDER BY name").fetchall()
+    # 【重构】查询所有教学班级，并动态找出它们对应的真实年级
+    classes = conn.execute("""
+        SELECT
+            tc.id,
+            tc.name,
+            -- 子查询：根据业务规则（同一教学班级内年级相同），
+            -- 从该班级的学生中找到他们行政班级的年级。
+            (SELECT ac.grade
+             FROM classes ac
+             JOIN student_class_memberships sm_admin ON ac.id = sm_admin.class_id
+             JOIN student_class_memberships sm_teach ON sm_admin.student_id = sm_teach.student_id
+             WHERE ac.type = '行政' AND sm_teach.class_id = tc.id
+             LIMIT 1) AS grade
+        FROM
+            classes tc
+        WHERE
+            tc.type = '教学'
+        ORDER BY
+            grade, tc.name
+    """).fetchall()
     conn.close()
     return render_template('index.html', classes=classes)
 
 @app.route('/api/students/<int:class_id>')
 def get_students(class_id):
-    """【修改】根据班级ID获取学生列表API"""
+    """【重构】根据班级ID获取学生列表，并附带今日考勤状态"""
+    today_str = date.today().isoformat()
     conn = get_db_connection()
-    # 【修改】通过新的关联表查询学生
+    
+    # 【修改】使用 LEFT JOIN 查询学生及其今日的缺勤记录
     students = conn.execute("""
-        SELECT s.id, s.name FROM students s
-        JOIN student_class_memberships sm ON s.id = sm.student_id
-        WHERE sm.class_id = ?
-        ORDER BY s.name
-    """, (class_id,)).fetchall()
+        SELECT
+            s.id,
+            s.name,
+            -- 如果能在当天的考勤记录中找到该学生，则 is_absent_today 为 1 (true)，否则为 0 (false)
+            CASE
+                WHEN ar.id IS NOT NULL THEN 1
+                ELSE 0
+            END AS is_absent_today
+        FROM
+            students s
+        JOIN
+            student_class_memberships sm ON s.id = sm.student_id
+        LEFT JOIN
+            attendance_records ar ON s.id = ar.student_id AND ar.attendance_date = ?
+        WHERE
+            sm.class_id = ?
+        ORDER BY
+            s.name
+    """, (today_str, class_id)).fetchall()
+    
     conn.close()
     return jsonify([dict(student) for student in students])
 
 @app.route('/api/attendance', methods=['POST'])
 def submit_attendance():
-    """【修改】只负责接收和保存考勤数据"""
+    """【重构】以最新提交为准，更新考勤数据"""
     data = request.get_json()
-    class_id = data.get('class_id')
+    class_id = data.get('class_id') # 教学班级ID
     absent_student_ids = data.get('absent_ids', [])
     today_str = date.today().isoformat()
     
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 将当天的缺勤记录写入数据库
+    # 1. 找出该教学班级下的所有学生ID
+    students_in_class = cursor.execute(
+        "SELECT student_id FROM student_class_memberships WHERE class_id = ?",
+        (class_id,)
+    ).fetchall()
+    student_ids_in_class = [s['student_id'] for s in students_in_class]
+
+    # 2. 删除这些学生今天所有的旧考勤记录
+    if student_ids_in_class:
+        # 构建占位符以安全地使用 IN 子句
+        placeholders = ','.join('?' for _ in student_ids_in_class)
+        params = student_ids_in_class + [today_str]
+        cursor.execute(
+            f"DELETE FROM attendance_records WHERE student_id IN ({placeholders}) AND attendance_date = ?",
+            params
+        )
+
+    # 3. 插入本次提交的新的缺勤记录
     for student_id in absent_student_ids:
-        # 为防止重复提交，可以先检查是否存在
-        existing_record = cursor.execute(
-            'SELECT id FROM attendance_records WHERE student_id = ? AND attendance_date = ?',
-            (student_id, today_str)
-        ).fetchone()
-        
-        if not existing_record:
-            cursor.execute(
-                'INSERT INTO attendance_records (student_id, class_id, attendance_date, is_absent) VALUES (?, ?, ?, 1)',
-                (student_id, class_id, today_str)
-            )
+        cursor.execute(
+            'INSERT INTO attendance_records (student_id, class_id, attendance_date, is_absent) VALUES (?, ?, ?, 1)',
+            (student_id, class_id, today_str)
+        )
             
     conn.commit()
     conn.close()
     
-    # 【修改】不再生成报告，只返回成功状态
-    return jsonify({"status": "success", "message": "考勤记录已保存"})
+    return jsonify({"status": "success", "message": "考勤记录已更新"})
 
 @app.route('/report')
 def show_report():
