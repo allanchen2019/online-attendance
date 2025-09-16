@@ -73,4 +73,40 @@ $(document).ready(function() {
             }
         });
     });
+
+    // 处理文件上传表单
+    $('#import-form').on('submit', function(e) {
+        e.preventDefault(); // 阻止表单默认提交
+
+        const fileInput = $('#student-file')[0];
+        if (fileInput.files.length === 0) {
+            alert('请先选择一个CSV文件。');
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('student_file', fileInput.files[0]);
+
+        const statusDiv = $('#import-status');
+        statusDiv.text('正在上传并处理...').removeClass('text-danger text-success');
+
+        $.ajax({
+            url: '/api/import_students',
+            type: 'POST',
+            data: formData,
+            processData: false, // 告诉jQuery不要处理数据
+            contentType: false, // 告诉jQuery不要设置contentType
+            success: function(response) {
+                statusDiv.text(response.message).addClass('text-success');
+                // 导入成功后刷新页面，以更新班级下拉列表
+                setTimeout(function() {
+                    location.reload();
+                }, 2000);
+            },
+            error: function(xhr) {
+                const errorMsg = xhr.responseJSON ? xhr.responseJSON.message : '导入失败，请检查文件格式或联系管理员。';
+                statusDiv.text(errorMsg).addClass('text-danger');
+            }
+        });
+    });
 });

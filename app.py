@@ -1,4 +1,6 @@
 import sqlite3
+import csv
+import io
 from flask import Flask, render_template, request, jsonify
 from datetime import date
 
@@ -16,15 +18,22 @@ def get_db_connection():
 def index():
     """渲染主页面"""
     conn = get_db_connection()
-    classes = conn.execute('SELECT * FROM classes ORDER BY grade, name').fetchall()
+    # 【修改】只选择“教学班级”用于点名
+    classes = conn.execute("SELECT * FROM classes WHERE type = '教学' ORDER BY name").fetchall()
     conn.close()
     return render_template('index.html', classes=classes)
 
 @app.route('/api/students/<int:class_id>')
 def get_students(class_id):
-    """根据班级ID获取学生列表API"""
+    """【修改】根据班级ID获取学生列表API"""
     conn = get_db_connection()
-    students = conn.execute('SELECT * FROM students WHERE class_id = ? ORDER BY name', (class_id,)).fetchall()
+    # 【修改】通过新的关联表查询学生
+    students = conn.execute("""
+        SELECT s.id, s.name FROM students s
+        JOIN student_class_memberships sm ON s.id = sm.student_id
+        WHERE sm.class_id = ?
+        ORDER BY s.name
+    """, (class_id,)).fetchall()
     conn.close()
     return jsonify([dict(student) for student in students])
 
@@ -61,54 +70,141 @@ def submit_attendance():
 
 @app.route('/report')
 def show_report():
-    """【新增】专门用于生成和显示报告的页面"""
+    """【重构】专门用于生成和显示报告的页面"""
     today_str = date.today().isoformat()
     conn = get_db_connection()
     
-    report_lines = []
-    # 查询所有有缺勤记录的年级
-    grades = conn.execute(
-        'SELECT DISTINCT c.grade FROM classes c JOIN attendance_records ar ON c.id = ar.class_id WHERE ar.attendance_date = ? ORDER BY c.grade',
-        (today_str,)
-    ).fetchall()
+    # 核心查询：获取今天所有缺勤学生，并 JOIN 查询出他们所在的行政班级信息
+    absent_students_details = conn.execute("""
+        SELECT
+            s.name AS student_name,
+            c.grade AS admin_grade,
+            c.name AS admin_class_name
+        FROM attendance_records ar
+        JOIN students s ON ar.student_id = s.id
+        JOIN student_class_memberships sm ON s.id = sm.student_id
+        JOIN classes c ON sm.class_id = c.id
+        WHERE ar.attendance_date = ? AND c.type = '行政'
+    """, (today_str,)).fetchall()
 
-    if not grades:
+    if not absent_students_details:
         final_report = "今日所有班级均无缺勤记录。"
     else:
-        for grade in grades:
-            grade_name = grade['grade']
-            report_lines.append(f"{grade_name}缺勤情况统计")
+        # 在内存中组织报告数据
+        grades_report = {}  # 结构: { '年级': { '班级': [学生名, ...], ... }, ... }
+        for row in absent_students_details:
+            grade = row['admin_grade']
+            class_name = row['admin_class_name']
+            student_name = row['student_name']
             
-            # 查询该年级下所有有缺勤记录的班级
-            classes_in_grade = conn.execute(
-                'SELECT DISTINCT c.id, c.name FROM classes c JOIN attendance_records ar ON c.id = ar.class_id WHERE ar.attendance_date = ? AND c.grade = ? ORDER BY c.name',
-                (today_str, grade_name)
-            ).fetchall()
+            if grade not in grades_report:
+                grades_report[grade] = {}
+            if class_name not in grades_report[grade]:
+                grades_report[grade][class_name] = []
+            
+            # 防止同一学生因加入多个教学班级而在报告中重复出现
+            if student_name not in grades_report[grade][class_name]:
+                grades_report[grade][class_name].append(student_name)
 
-            for cls in classes_in_grade:
-                report_lines.append(f"班级：{cls['name']}")
+        # 格式化为最终的报告字符串
+        report_lines = []
+        # 按年级排序
+        for grade in sorted(grades_report.keys()):
+            report_lines.append(f"{grade}缺勤情况统计")
+            # 按班级名排序
+            for class_name in sorted(grades_report[grade].keys()):
+                students = grades_report[grade][class_name]
+                if not students: continue # 如果班级内没有缺勤学生，则跳过
                 
-                absent_students = conn.execute(
-                    """
-                    SELECT s.name FROM students s
-                    JOIN attendance_records ar ON s.id = ar.student_id
-                    WHERE ar.attendance_date = ? AND ar.class_id = ?
-                    """,
-                    (today_str, cls['id'])
-                ).fetchall()
-                
-                absent_count = len(absent_students)
-                absent_names = "，".join([s['name'] for s in absent_students])
-                
-                report_lines.append(f"缺勤人数：{absent_count}")
-                report_lines.append(f"缺勤学生姓名：{absent_names}。")
+                report_lines.append(f"班级：{class_name}")
+                report_lines.append(f"缺勤人数：{len(students)}")
+                report_lines.append(f"缺勤学生姓名：{'，'.join(students)}。")
                 report_lines.append("")
-
-        final_report = "\n".join(report_lines)
+        
+        if not report_lines:
+            final_report = "今日所有班级均无缺勤记录。"
+        else:
+            final_report = "\n".join(report_lines)
 
     conn.close()
     
     return render_template('report.html', report_data=final_report)
+
+
+@app.route('/api/import_students', methods=['POST'])
+def import_students():
+    """【新增】处理上传的CSV文件并导入学生数据"""
+    if 'student_file' not in request.files:
+        return jsonify({"status": "error", "message": "没有找到文件部分"}), 400
+
+    file = request.files['student_file']
+    if file.filename == '':
+        return jsonify({"status": "error", "message": "没有选择文件"}), 400
+
+    if file and file.filename.endswith('.csv'):
+        try:
+            # 将文件内容读取为字符串并解码
+            stream = io.StringIO(file.stream.read().decode("UTF-8"), newline=None)
+            csv_reader = csv.reader(stream)
+            
+            header = next(csv_reader) # 跳过表头
+            expected_header = ['年级', '班级', '姓名', '上课班级']
+            if header != expected_header:
+                return jsonify({"status": "error", "message": f"CSV文件表头不正确，应为: {','.join(expected_header)}"}), 400
+
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            imported_count = 0
+            for row in csv_reader:
+                grade, class_name, student_name, teaching_class_name = row
+
+                # 1. 处理行政班级
+                cursor.execute("SELECT id FROM classes WHERE grade = ? AND name = ? AND type = '行政'", (grade, class_name))
+                admin_class = cursor.fetchone()
+                if not admin_class:
+                    cursor.execute("INSERT INTO classes (grade, name, type) VALUES (?, ?, '行政')", (grade, class_name))
+                    admin_class_id = cursor.lastrowid
+                else:
+                    admin_class_id = admin_class['id']
+
+                # 2. 处理学生
+                unique_key = f"{grade}-{class_name}-{student_name}"
+                cursor.execute("SELECT id FROM students WHERE unique_key = ?", (unique_key,))
+                student = cursor.fetchone()
+                if not student:
+                    cursor.execute("INSERT INTO students (name, unique_key) VALUES (?, ?)", (student_name, unique_key))
+                    student_id = cursor.lastrowid
+                else:
+                    student_id = student['id']
+
+                # 3. 处理教学班级
+                cursor.execute("SELECT id FROM classes WHERE name = ? AND type = '教学'", (teaching_class_name,))
+                teaching_class = cursor.fetchone()
+                if not teaching_class:
+                    # 教学班级的 grade 设为 '通用'
+                    cursor.execute("INSERT INTO classes (grade, name, type) VALUES ('通用', ?, '教学')", (teaching_class_name,))
+                    teaching_class_id = cursor.lastrowid
+                else:
+                    teaching_class_id = teaching_class['id']
+
+                # 4. 建立关系 (使用 INSERT OR IGNORE 避免重复导入时出错)
+                # 关联学生与行政班级
+                cursor.execute("INSERT OR IGNORE INTO student_class_memberships (student_id, class_id) VALUES (?, ?)", (student_id, admin_class_id))
+                # 关联学生与教学班级
+                cursor.execute("INSERT OR IGNORE INTO student_class_memberships (student_id, class_id) VALUES (?, ?)", (student_id, teaching_class_id))
+                
+                imported_count += 1
+
+            conn.commit()
+            conn.close()
+            
+            return jsonify({"status": "success", "message": f"成功导入 {imported_count} 条记录！页面即将刷新..."})
+
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"处理文件时发生错误: {str(e)}"}), 500
+    else:
+        return jsonify({"status": "error", "message": "不支持的文件类型，请上传CSV文件"}), 400
 
 
 if __name__ == '__main__':
